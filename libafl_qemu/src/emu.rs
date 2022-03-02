@@ -188,6 +188,7 @@ extern "C" {
     fn libafl_qemu_num_regs() -> i32;
     fn libafl_qemu_set_breakpoint(addr: u64) -> i32;
     fn libafl_qemu_remove_breakpoint(addr: u64) -> i32;
+    fn libafl_flush_jit();
     fn libafl_qemu_set_hook(addr: u64, callback: extern "C" fn(u64), val: u64) -> i32;
     fn libafl_qemu_remove_hook(addr: u64) -> i32;
     fn libafl_qemu_run() -> i32;
@@ -214,6 +215,7 @@ extern "C" {
 
     static exec_path: *const u8;
     static guest_base: usize;
+    static mut mmap_next_start: GuestAddr;
 
     static mut libafl_exec_edge_hook: unsafe extern "C" fn(u64);
     static mut libafl_gen_edge_hook: unsafe extern "C" fn(u64, u64) -> u64;
@@ -239,6 +241,8 @@ extern "C" {
     static mut libafl_exec_cmp_hook4: unsafe extern "C" fn(u64, u32, u32);
     static mut libafl_exec_cmp_hook8: unsafe extern "C" fn(u64, u64, u64);
     static mut libafl_gen_cmp_hook: unsafe extern "C" fn(u64, u32) -> u64;
+
+    static mut libafl_on_thread_hook: unsafe extern "C" fn(u32);
 
     static mut libafl_pre_syscall_hook:
         unsafe extern "C" fn(i32, u64, u64, u64, u64, u64, u64, u64, u64) -> SyscallHookResult;
@@ -474,6 +478,15 @@ impl Emulator {
         unsafe { libafl_set_brk(brk.into()) };
     }
 
+    #[must_use]
+    pub fn get_mmap_start(&self) -> GuestAddr {
+        unsafe { mmap_next_start }
+    }
+
+    pub fn set_mmap_start(&self, start: GuestAddr) {
+        unsafe { mmap_next_start = start };
+    }
+
     fn mmap(
         &self,
         addr: GuestAddr,
@@ -530,6 +543,12 @@ impl Emulator {
             Ok(())
         } else {
             Err(format!("Failed to unmap {}", addr))
+        }
+    }
+
+    pub fn flush_jit(&self) {
+        unsafe {
+            libafl_flush_jit();
         }
     }
 
@@ -659,6 +678,12 @@ impl Emulator {
     pub fn set_gen_cmp_hook(&self, hook: extern "C" fn(pc: u64, size: u32) -> u64) {
         unsafe {
             libafl_gen_cmp_hook = hook;
+        }
+    }
+
+    pub fn set_on_thread_hook(&self, hook: extern "C" fn(tid: u32)) {
+        unsafe {
+            libafl_on_thread_hook = hook;
         }
     }
 
@@ -804,6 +829,10 @@ pub mod pybind {
 
         fn load_addr(&self) -> GuestAddr {
             self.emu.load_addr()
+        }
+
+        fn flush_jit(&self) {
+            self.emu.flush_jit();
         }
 
         fn map_private(&self, addr: GuestAddr, size: usize, perms: i32) -> PyResult<GuestAddr> {

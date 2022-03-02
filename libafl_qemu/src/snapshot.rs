@@ -12,10 +12,12 @@ use crate::{
     emu::{Emulator, MmapPerms},
     helper::{QemuHelper, QemuHelperTuple},
     hooks::QemuHooks,
-    GuestAddr, SYS_mmap, SYS_mprotect, SYS_mremap,
+    GuestAddr, SYS_fstat, SYS_fstatfs, SYS_futex, SYS_getrandom, SYS_mmap, SYS_mprotect,
+    SYS_mremap, SYS_newfstatat, SYS_pread64, SYS_read, SYS_readlinkat, SYS_statfs,
 };
 
 pub const SNAPSHOT_PAGE_SIZE: usize = 4096;
+pub const SNAPSHOT_PAGE_MASK: GuestAddr = !(SNAPSHOT_PAGE_SIZE as GuestAddr - 1);
 
 #[derive(Debug)]
 pub struct SnapshotPageInfo {
@@ -46,6 +48,7 @@ pub struct QemuSnapshotHelper {
     pub new_maps: Mutex<IntervalTree<GuestAddr, Option<MmapPerms>>>,
     pub pages: HashMap<GuestAddr, SnapshotPageInfo>,
     pub brk: GuestAddr,
+    pub mmap_start: GuestAddr,
     pub empty: bool,
 }
 
@@ -57,6 +60,7 @@ impl QemuSnapshotHelper {
             new_maps: Mutex::new(IntervalTree::new()),
             pages: HashMap::default(),
             brk: 0,
+            mmap_start: 0,
             empty: true,
         }
     }
@@ -64,6 +68,7 @@ impl QemuSnapshotHelper {
     #[allow(clippy::uninit_assumed_init)]
     pub fn snapshot(&mut self, emulator: &Emulator) {
         self.brk = emulator.get_brk();
+        self.mmap_start = emulator.get_mmap_start();
         self.pages.clear();
         for map in emulator.mappings() {
             let mut addr = map.start();
@@ -106,9 +111,9 @@ impl QemuSnapshotHelper {
 
     pub fn access(&mut self, addr: GuestAddr, size: usize) {
         debug_assert!(size > 0);
-        let page = addr & (SNAPSHOT_PAGE_SIZE as GuestAddr - 1);
+        let page = addr & SNAPSHOT_PAGE_MASK;
         self.page_access(page);
-        let second_page = (addr + size as GuestAddr - 1) & (SNAPSHOT_PAGE_SIZE as GuestAddr - 1);
+        let second_page = (addr + size as GuestAddr - 1) & SNAPSHOT_PAGE_MASK;
         if page != second_page {
             self.page_access(second_page);
         }
@@ -116,6 +121,7 @@ impl QemuSnapshotHelper {
 
     pub fn reset(&mut self, emulator: &Emulator) {
         self.reset_maps(emulator);
+
         for acc in self.accesses.iter_mut() {
             for page in unsafe { &(*acc.get()).dirty } {
                 if let Some(info) = self.pages.get_mut(page) {
@@ -127,7 +133,9 @@ impl QemuSnapshotHelper {
             }
             unsafe { (*acc.get()).clear() };
         }
+
         emulator.set_brk(self.brk);
+        emulator.set_mmap_start(self.mmap_start);
     }
 
     pub fn add_mapped(&mut self, start: GuestAddr, mut size: usize, perms: Option<MmapPerms>) {
@@ -146,7 +154,7 @@ impl QemuSnapshotHelper {
             let addr = r.interval().start;
             let end = r.interval().end;
             let perms = r.data();
-            let mut page = addr & (SNAPSHOT_PAGE_SIZE as GuestAddr - 1);
+            let mut page = addr & SNAPSHOT_PAGE_MASK;
             let mut prev = None;
             while page < end {
                 if let Some(info) = self.pages.get(&page) {
@@ -289,6 +297,7 @@ pub fn trace_write_n_snapshot<I, QT, S>(
 }
 
 #[allow(clippy::too_many_arguments)]
+#[allow(non_upper_case_globals)]
 pub fn trace_mmap_snapshot<I, QT, S>(
     _emulator: &Emulator,
     helpers: &mut QT,
@@ -298,7 +307,7 @@ pub fn trace_mmap_snapshot<I, QT, S>(
     a0: u64,
     a1: u64,
     a2: u64,
-    _a3: u64,
+    a3: u64,
     _a4: u64,
     _a5: u64,
     _a6: u64,
@@ -308,29 +317,73 @@ where
     I: Input,
     QT: QemuHelperTuple<I, S>,
 {
-    if result as GuestAddr == GuestAddr::MAX
-    /* -1 */
-    {
-        return result;
-    }
-    if i64::from(sys_num) == SYS_mmap {
-        if let Ok(prot) = MmapPerms::try_from(a2 as i32) {
+    // NOT A COMPLETE LIST OF MEMORY EFFECTS
+    match i64::from(sys_num) {
+        SYS_read | SYS_pread64 => {
             let h = helpers
                 .match_first_type_mut::<QemuSnapshotHelper>()
                 .unwrap();
-            h.add_mapped(result as GuestAddr, a1 as usize, Some(prot));
+            h.access(a1 as GuestAddr, a2 as usize);
         }
-    } else if i64::from(sys_num) == SYS_mremap {
-        let h = helpers
-            .match_first_type_mut::<QemuSnapshotHelper>()
-            .unwrap();
-        h.add_mapped(result as GuestAddr, a2 as usize, None);
-    } else if i64::from(sys_num) == SYS_mprotect {
-        if let Ok(prot) = MmapPerms::try_from(a2 as i32) {
+        SYS_readlinkat => {
             let h = helpers
                 .match_first_type_mut::<QemuSnapshotHelper>()
                 .unwrap();
-            h.add_mapped(a0 as GuestAddr, a2 as usize, Some(prot));
+            h.access(a2 as GuestAddr, a3 as usize);
+        }
+        SYS_futex => {
+            let h = helpers
+                .match_first_type_mut::<QemuSnapshotHelper>()
+                .unwrap();
+            h.access(a0 as GuestAddr, a3 as usize);
+        }
+        SYS_newfstatat => {
+            if a2 != 0 {
+                let h = helpers
+                    .match_first_type_mut::<QemuSnapshotHelper>()
+                    .unwrap();
+                h.access(a2 as GuestAddr, 4096); // stat is not greater than a page
+            }
+        }
+        SYS_statfs | SYS_fstatfs | SYS_fstat => {
+            let h = helpers
+                .match_first_type_mut::<QemuSnapshotHelper>()
+                .unwrap();
+            h.access(a1 as GuestAddr, 4096); // stat is not greater than a page
+        }
+        SYS_getrandom => {
+            let h = helpers
+                .match_first_type_mut::<QemuSnapshotHelper>()
+                .unwrap();
+            h.access(a0 as GuestAddr, a1 as usize);
+        }
+        // mmap syscalls
+        _ => {
+            if result as GuestAddr == GuestAddr::MAX
+            /* -1 */
+            {
+                return result;
+            }
+            if i64::from(sys_num) == SYS_mmap {
+                if let Ok(prot) = MmapPerms::try_from(a2 as i32) {
+                    let h = helpers
+                        .match_first_type_mut::<QemuSnapshotHelper>()
+                        .unwrap();
+                    h.add_mapped(result as GuestAddr, a1 as usize, Some(prot));
+                }
+            } else if i64::from(sys_num) == SYS_mremap {
+                let h = helpers
+                    .match_first_type_mut::<QemuSnapshotHelper>()
+                    .unwrap();
+                h.add_mapped(result as GuestAddr, a2 as usize, None);
+            } else if i64::from(sys_num) == SYS_mprotect {
+                if let Ok(prot) = MmapPerms::try_from(a2 as i32) {
+                    let h = helpers
+                        .match_first_type_mut::<QemuSnapshotHelper>()
+                        .unwrap();
+                    h.add_mapped(a0 as GuestAddr, a2 as usize, Some(prot));
+                }
+            }
         }
     }
     result
